@@ -1,0 +1,122 @@
+import pyomo.environ as pyo
+import numpy as np
+
+# Problem dimensions
+N = 10  # Number of customers
+K = 5   # Number of facilities
+
+# Random fixed customer locations
+np.random.seed(1234)
+x_customers = np.random.rand(N) * 10
+y_customers = np.random.rand(N) * 10
+print(f"x_customers: {x_customers}")
+print(f"y_customers: {y_customers}")
+
+# Initial facility locations (not fixed, just for reference)
+x_init_facilities = np.random.rand(K) * 10
+y_init_facilities = np.random.rand(K) * 10
+print(f"x_init_facilities: {x_init_facilities}")
+print(f"y_init_facilities: {y_init_facilities}")
+
+# Pyomo model
+model = pyo.ConcreteModel()
+
+# Sets
+model.I = pyo.RangeSet(0, N - 1)  # Customers
+model.J = pyo.RangeSet(0, K - 1)  # Facilities
+model.L = pyo.RangeSet(0, K - 1)  # Facilities (for routing)
+model.M = pyo.RangeSet(0, K - 1)  # Facilities (for routing)
+
+# Variables
+model.q = pyo.Var(model.I, model.J, bounds=(0, 1), domain=pyo.NonNegativeReals)
+model.r = pyo.Var(model.L, model.M, bounds=(0, 1), domain=pyo.NonNegativeReals)
+model.u = pyo.Var(model.L, bounds=(1, K), domain=pyo.Integers)  # INTEGER u
+model.yx = pyo.Var(model.J, bounds=(0, 10))  # Facility x-coordinates
+model.yy = pyo.Var(model.J, bounds=(0, 10))  # Facility y-coordinates
+
+# Binary vars for "u all-different"
+model.b = pyo.Var(model.L, model.L, domain=pyo.Binary)
+
+# Objective: Maximize entropy
+def entropy_rule(m):
+    return -sum(m.q[i, j] * pyo.log(m.q[i, j]+1e-6) + (1-m.q[i,j]) * pyo.log(1-m.q[i,j]+1e-6)
+               for i in m.I for j in m.J) \
+           -sum(m.r[l, m_] * pyo.log(m.r[l, m_]+1e-6) + (1-m.r[l,m_]) * pyo.log(1-m.r[l,m_]+1e-6)
+               for l in m.L for m_ in m.M)
+model.obj = pyo.Objective(rule=entropy_rule, sense=pyo.maximize)
+
+# Cost constraint using squared Euclidean distances
+C0 = 700
+def cost_constraint(m):
+    assign_cost = sum(
+        m.q[i, j] * ((x_customers[i] - m.yx[j])**2 + (y_customers[i] - m.yy[j])**2)
+        for i in m.I for j in m.J
+    )
+    route_cost = sum(
+        m.r[l, m_] * ((m.yx[l] - m.yx[m_])**2 + (m.yy[l] - m.yy[m_])**2)
+        for l in m.L for m_ in m.M
+    )
+    return assign_cost + route_cost <= C0
+model.cost = pyo.Constraint(rule=cost_constraint)
+
+# Each customer assigned to one facility
+def customer_assignment(m, i):
+    return sum(m.q[i, j] for j in m.J) == 1
+model.customer_assign = pyo.Constraint(model.I, rule=customer_assignment)
+
+# Each facility has one outbound and one inbound link (excluding self-links)
+def route_out(m, m_):
+    return sum(m.r[l, m_] for l in m.L if l != m_) == 1
+def route_in(m, l):
+    return sum(m.r[l, m_] for m_ in m.M if m_ != l) == 1
+model.outbound = pyo.Constraint(model.M, rule=route_out)
+model.inbound = pyo.Constraint(model.L, rule=route_in)
+
+# Eliminate self-loops
+def no_self_loop_rule(m, l):
+    return m.r[l, l] == 0
+model.no_self_loop = pyo.Constraint(model.L, rule=no_self_loop_rule)
+
+# MTZ constraints
+def mtz_rule(m, l, m_):
+    if l == m_:
+        return pyo.Constraint.Skip
+    return m.u[l] - m.u[m_] + K * m.r[l, m_] <= K - 1
+model.mtz = pyo.Constraint(model.L, model.M, rule=mtz_rule)
+
+# All-different constraints for u using big-M
+M_big = K
+def all_diff1(m, l1, l2):
+    if l1 >= l2:
+        return pyo.Constraint.Skip
+    return m.u[l1] - m.u[l2] <= -1 + M_big * m.b[l1, l2]
+model.all_diff1 = pyo.Constraint(model.L, model.L, rule=all_diff1)
+
+def all_diff2(m, l1, l2):
+    if l1 >= l2:
+        return pyo.Constraint.Skip
+    return m.u[l2] - m.u[l1] <= -1 + M_big * (1 - m.b[l1, l2])
+model.all_diff2 = pyo.Constraint(model.L, model.L, rule=all_diff2)
+
+# Solve using BONMIN
+solver = pyo.SolverFactory('bonmin')
+results = solver.solve(model, tee=True)
+
+# Extract results
+q_sol = np.array([[pyo.value(model.q[i, j]) for j in model.J] for i in model.I])
+r_sol = np.array([[pyo.value(model.r[l, m_]) for m_ in model.M] for l in model.L])
+u_sol = np.array([pyo.value(model.u[l]) for l in model.L])
+yx_sol = np.array([pyo.value(model.yx[j]) for j in model.J])
+yy_sol = np.array([pyo.value(model.yy[j]) for j in model.J])
+
+# Output
+print("\nAssignment matrix (q):")
+print(q_sol)
+print("\nRouting matrix (r):")
+print(r_sol)
+print("\nMTZ variables (u):")
+print(u_sol)
+print("\nFacility x-coordinates (yx):")
+print(yx_sol)
+print("\nFacility y-coordinates (yy):")
+print(yy_sol)
